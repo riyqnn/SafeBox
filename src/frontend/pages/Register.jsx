@@ -107,7 +107,7 @@ function Register() {
 
         <p className="text-xs text-gray-600 mt-4">
           Already have an account?  
-          <Link to="/sign-In" className="text-[#5a9eff] font-medium">Sign In</Link>
+          <Link to="/sign-in" className="text-[#5a9eff] font-medium">Sign In</Link>
         </p>
       </div>
     </div>
