@@ -8,39 +8,53 @@ const GoogleLoginButton = () => {
   const login = useGoogleLogin({
     onSuccess: async (tokenResponse) => {
       try {
-        console.log("Login successful!");
-
-        // Ambil access_token dari response
         const accessToken = tokenResponse.access_token;
-
-        // Ambil data user dari Google API
         const userInfo = await axios.get(
           "https://www.googleapis.com/oauth2/v1/userinfo",
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+
+        // PERBAIKAN 1: Gunakan endpoint yang benar sesuai backend
+        const userResponse = await axios.post(
+          "http://localhost:5000/api/users/get-or-create", // Tambahkan /api dan perbaiki path
+          { email: userInfo.data.email },
           {
-            headers: { Authorization: `Bearer ${accessToken}` },
+            headers: {
+              'Content-Type': 'application/json'
+            }
           }
         );
 
-        // Simpan email dan token di localStorage
-        localStorage.setItem("email", userInfo.data.email);
-        localStorage.setItem("token", accessToken);
-
-        // Hanya log informasi non-sensitif jika perlu (untuk pengembangan)
-        if (process.env.NODE_ENV === 'development') {
-          console.log("User logged in successfully.");
+        // PERBAIKAN 2: Validasi response
+        if (!userResponse.data?.user?.id) {
+          throw new Error('Invalid user response from server');
         }
 
-        // Redirect ke dashboard
-        console.log("Redirecting to dashboard...");
+        const { id: userId, email } = userResponse.data.user;
+
+        // Simpan informasi user
+        localStorage.setItem("user_id", userId);
+        localStorage.setItem("email", email);
+        localStorage.setItem("token", accessToken);
+
         navigate("/dashboard");
       } catch (error) {
-        console.error("Error fetching user info:", error);
+        console.error("Error:", error);
+        // PERBAIKAN 3: Handle error lebih baik
+        if (error.response) {
+          console.error("Server response:", error.response.data);
+          alert(`Error: ${error.response.data.message || 'Server error'}`);
+        } else {
+          alert('Login gagal, silahkan coba lagi');
+        }
       }
     },
-    onError: () => {
-      console.log("Login Failed");
+    onError: (error) => {
+      console.log("Login Failed:", error);
+      alert('Login dengan Google gagal');
     },
   });
+
 
   return (
     <button
