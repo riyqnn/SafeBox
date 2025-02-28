@@ -6,6 +6,8 @@ import path from 'path';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import rateLimit from 'express-rate-limit';
+import morgan from 'morgan';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,11 +18,19 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors({
-    origin: 'http://localhost:5173', // Sesuaikan dengan frontend
+    origin: ['http://localhost:5173'],
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'x-user-id']
 }));
 app.use(express.json());
+app.use(morgan('combined'));
+
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100
+});
+app.use(limiter);
 
 // Konfigurasi direktori upload
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -35,14 +45,11 @@ const pool = mysql.createPool({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASS,
-    database: process.env.DB_NAME
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
-
-const handleError = (res, message, error) => {
-    console.error(`${message}:`, error);
-    res.status(500).json({ success: false, message: `${message}: ${error.message}` });
-};
-
 
 // Inisialisasi database
 (async () => {
@@ -54,8 +61,9 @@ const handleError = (res, message, error) => {
             CREATE TABLE IF NOT EXISTS users (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 email VARCHAR(255) NOT NULL UNIQUE,
+                name VARCHAR(255),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         `);
 
         await connection.query(`
@@ -68,8 +76,18 @@ const handleError = (res, message, error) => {
                 file_size BIGINT NOT NULL,
                 favorite BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        `);
+
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                action VARCHAR(255) NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         `);
 
         connection.release();
@@ -79,27 +97,55 @@ const handleError = (res, message, error) => {
     }
 })();
 
+// Helper functions
+const handleError = (res, message, error) => {
+    console.error(`${message}:`, error);
+    res.status(500).json({ success: false, message: `${message}: ${error.message}` });
+};
+
+const logActivity = async (userId, action) => {
+    try {
+        await pool.query(
+            `INSERT INTO activity_log (user_id, action) VALUES (?, ?)`,
+            [userId, action]
+        );
+    } catch (error) {
+        console.error('Gagal mencatat aktivitas:', error);
+    }
+};
+
+// Routes
 app.post('/api/users/get-or-create', async (req, res) => {
     try {
         const { email, name } = req.body;
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-        if (!email) {
-            return res.status(400).json({ success: false, message: 'Email diperlukan' });
+        if (!email || !emailRegex.test(email)) {
+            return res.status(400).json({ success: false, message: 'Email tidak valid' });
         }
 
         const [users] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
 
         if (users.length > 0) {
             return res.json({ success: true, user: users[0] });
-        } else {
-            const result = await pool.query(
-                'INSERT INTO users (email, name) VALUES (?, ?)',
-                [email, name]
-            );
-            return res.json({ success: true, user: { id: result.insertId, email, name } });
         }
+
+        const [result] = await pool.query(
+            'INSERT INTO users (email, name) VALUES (?, ?)',
+            [email, name]
+        );
+
+        res.json({ 
+            success: true, 
+            user: { 
+                id: result.insertId, 
+                email, 
+                name,
+                created_at: new Date()
+            } 
+        });
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Server error', error: error.message });
+        handleError(res, 'Server error', error);
     }
 });
 
@@ -119,112 +165,109 @@ const validateUser = async (req, res, next) => {
         req.user = users[0];
         next();
     } catch (error) {
-        res.status(500).json({ success: false, message: `Gagal validasi user: ${error.message}` });
+        handleError(res, 'Gagal validasi user', error);
     }
 };
 
-// Validasi jenis file
-const allowedTypes = {
-    image: ['image/jpeg', 'image/png', 'image/gif'],
-    document: [
-        'application/pdf',
-        'application/msword',
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'text/plain'
-    ],
-    video: ['video/mp4', 'video/quicktime'],
-    archive: [
-        'application/zip',
-        'application/x-rar-compressed',
-        'application/x-7z-compressed'
-    ]
-};
-
-const allowedExtensions = {
-    image: ['.jpg', '.jpeg', '.png', '.gif'],
-    document: ['.pdf', '.doc', '.docx', '.txt'],
-    video: ['.mp4', '.mov'],
-    archive: ['.zip', '.rar', '.7z']
-};
-
+// File handling
 const fileFilter = (req, file, cb) => {
-    const mimeType = file.mimetype;
+    const allowedTypes = [
+        'image/jpeg', 'image/png', 'image/gif',
+        'application/pdf', 'application/msword', 
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'text/plain', 'video/mp4', 'video/quicktime',
+        'application/zip', 'application/x-rar-compressed',
+        'application/x-7z-compressed'
+    ];
+
+    const allowedExtensions = [
+        '.jpg', '.jpeg', '.png', '.gif', '.pdf',
+        '.doc', '.docx', '.txt', '.mp4', '.mov',
+        '.zip', '.rar', '.7z'
+    ];
+
     const ext = path.extname(file.originalname).toLowerCase();
-
-    // Cek apakah file memiliki ekstensi atau MIME type yang diizinkan
-    const isAllowed =
-        (allowedTypes.image.includes(mimeType) || allowedExtensions.image.includes(ext)) ||
-        (allowedTypes.document.includes(mimeType) || allowedExtensions.document.includes(ext)) ||
-        (allowedTypes.video.includes(mimeType) || allowedExtensions.video.includes(ext)) ||
-        (allowedTypes.archive.includes(mimeType) || allowedExtensions.archive.includes(ext));
-
-    if (isAllowed) {
+    
+    if (allowedTypes.includes(file.mimetype) && allowedExtensions.includes(ext)) {
         cb(null, true);
     } else {
-        cb(new Error(`File type ${ext} (${mimeType}) tidak diperbolehkan`), false);
+        cb(new Error(`Jenis file tidak didukung: ${ext} (${file.mimetype})`));
     }
 };
 
-// Konfigurasi Multer
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         const userId = req.headers['x-user-id'];
-        const userUploadsDir = path.join(uploadsDir, userId.toString());
-        if (!fs.existsSync(userUploadsDir)) {
-            fs.mkdirSync(userUploadsDir, { recursive: true });
-        }
+        const userUploadsDir = path.join(uploadsDir, userId);
+        fs.mkdirSync(userUploadsDir, { recursive: true });
         cb(null, userUploadsDir);
     },
     filename: (req, file, cb) => {
-        cb(null, Date.now() + path.extname(file.originalname));
+        cb(null, file.originalname);
     }
 });
 
-const upload = multer({ storage, fileFilter });
+const upload = multer({ 
+    storage, 
+    fileFilter,
+    limits: { fileSize: 1024 * 1024 * 100 } // 100MB
+});
 
-// Endpoint upload file
 app.post('/api/files/upload', validateUser, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
-            return res.status(400).json({ success: false, message: 'File tidak ditemukan atau format tidak valid' });
+            return res.status(400).json({ success: false, message: 'File tidak valid' });
         }
 
         const { id: userId } = req.user;
         const { filename, mimetype, size } = req.file;
-        const filePath = `/uploads/${userId}/${filename}`;
 
+        // Cek duplikat file
+        const [existing] = await pool.query(
+            'SELECT id FROM files WHERE user_id = ? AND filename = ?',
+            [userId, filename]
+        );
+
+        if (existing.length > 0) {
+            return res.status(409).json({ 
+                success: false, 
+                message: 'File dengan nama yang sama sudah ada' 
+            });
+        }
+
+        const filePath = `/uploads/${userId}/${filename}`;
         const [result] = await pool.query(
-            `INSERT INTO files (user_id, filename, file_path, file_type, file_size) VALUES (?, ?, ?, ?, ?)`,
+            `INSERT INTO files (user_id, filename, file_path, file_type, file_size)
+             VALUES (?, ?, ?, ?, ?)`,
             [userId, filename, filePath, mimetype, size]
         );
+
+        // Catat aktivitas
+        await logActivity(userId, `File uploaded: ${filename}`);
 
         res.status(201).json({
             success: true,
             data: {
+                ...req.file,
                 id: result.insertId,
-                user_id: userId,
-                filename,
                 url: `http://localhost:${PORT}${filePath}`,
-                file_type: mimetype,
-                file_size: size,
                 favorite: false,
                 created_at: new Date()
             }
         });
     } catch (error) {
-        res.status(500).json({ success: false, message: `Gagal upload file: ${error.message}` });
+        handleError(res, 'Gagal upload file', error);
     }
 });
 
-// Endpoint mendapatkan daftar file user
 app.get('/api/files', validateUser, async (req, res) => {
     try {
         const { id: userId } = req.user;
-        const { favorite } = req.query; // Ambil query param favorite
+        const { favorite } = req.query;
 
-        let query = `SELECT *, CONCAT("/uploads/", user_id, "/", filename) as url 
+        let query = `SELECT *, CONCAT('/uploads/', user_id, '/', filename) as url 
                      FROM files WHERE user_id = ?`;
-        let params = [userId];
+        const params = [userId];
 
         if (favorite === 'true') {
             query += ' AND favorite = 1';
@@ -235,15 +278,14 @@ app.get('/api/files', validateUser, async (req, res) => {
         const [files] = await pool.query(query, params);
         res.json({ success: true, data: files });
     } catch (error) {
-        res.status(500).json({ success: false, message: `Gagal mengambil file: ${error.message}` });
+        handleError(res, 'Gagal mengambil file', error);
     }
 });
 
-
 app.patch('/api/files/:id/favorite', validateUser, async (req, res) => {
     try {
-        const fileId = req.params.id;
         const { id: userId } = req.user;
+        const fileId = req.params.id;
 
         const [files] = await pool.query(
             'SELECT * FROM files WHERE id = ? AND user_id = ?',
@@ -254,24 +296,82 @@ app.patch('/api/files/:id/favorite', validateUser, async (req, res) => {
             return res.status(404).json({ success: false, message: 'File tidak ditemukan' });
         }
 
-        const newFavoriteStatus = !files[0].favorite;
+        const newStatus = !files[0].favorite;
+        await pool.query(
+            'UPDATE files SET favorite = ? WHERE id = ?',
+            [newStatus, fileId]
+        );
 
-        await pool.query('UPDATE files SET favorite = ? WHERE id = ? AND user_id = ?', [
-            newFavoriteStatus,
-            fileId,
-            userId
-        ]);
+        // Catat aktivitas
+        const action = newStatus ? 'marked as favorite' : 'removed from favorites';
+        await logActivity(userId, `File ${files[0].filename} ${action}`);
 
-        res.json({ success: true, message: 'Status favorite diperbarui', favorite: newFavoriteStatus });
+        res.json({ 
+            success: true, 
+            message: 'Status favorite diperbarui',
+            favorite: newStatus 
+        });
     } catch (error) {
-        res.status(500).json({ success: false, message: `Gagal memperbarui favorite: ${error.message}` });
+        handleError(res, 'Gagal memperbarui favorite', error);
     }
 });
 
-// Download file endpoint dengan validasi user
+app.delete('/api/files/:id', validateUser, async (req, res) => {
+    try {
+        const { id: userId } = req.user;
+        const fileId = req .params.id;
+
+        const [files] = await pool.query(
+            'SELECT * FROM files WHERE id = ? AND user_id = ?',
+            [fileId, userId]
+        );
+
+        if (files.length === 0) {
+            return res.status(404).json({ success: false, message: 'File tidak ditemukan' });
+        }
+
+        // Catat aktivitas sebelum menghapus
+        await logActivity(userId, `File deleted: ${files[0].filename}`);
+
+        const filePath = path.join(__dirname, files[0].file_path);
+
+        // Hapus file dari sistem
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+        }
+
+        // Hapus dari database
+        await pool.query('DELETE FROM files WHERE id = ?', [fileId]);
+
+        res.json({ success: true, message: 'File berhasil dihapus' });
+    } catch (error) {
+        handleError(res, 'Gagal menghapus file', error);
+    }
+});
+
+app.get('/api/files/:id', validateUser , async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const { id: userId } = req.user;
+
+        const [files] = await pool.query(
+            `SELECT *, CONCAT("/uploads/", user_id, "/", filename) as url 
+             FROM files WHERE id = ? AND user_id = ?`, 
+            [fileId, userId]
+        );
+
+        if (files.length === 0) {
+            return res.status(404).json({ success: false, message: 'File tidak ditemukan' });
+        }
+
+        res.json({ success: true, data: files[0] });
+    } catch (error) {
+        handleError(res, 'Gagal mengambil file', error);
+    }
+});
+
 app.get('/api/files/:id/download', validateUser , async (req, res) => {
     try {
-        // Cek kepemilikan file
         const [results] = await pool.query(
             'SELECT * FROM files WHERE id = ? AND user_id = ?', 
             [req.params.id, req.user.id]
@@ -309,59 +409,40 @@ app.get('/api/files/:id/download', validateUser , async (req, res) => {
     }
 });
 
-// Delete file endpoint
-app.get('/api/files/:id', validateUser, async (req, res) => {
+// Get activity log
+app.get('/api/activity', validateUser, async (req, res) => {
     try {
-        const fileId = req.params.id;
         const { id: userId } = req.user;
-
-        const [files] = await pool.query(
-            `SELECT *, CONCAT("/uploads/", user_id, "/", filename) as url 
-             FROM files WHERE id = ? AND user_id = ?`, 
-            [fileId, userId]
+        
+        const [activities] = await pool.query(
+            `SELECT * FROM activity_log 
+             WHERE user_id = ? 
+             ORDER BY timestamp DESC 
+             LIMIT 10`,
+            [userId] 
         );
 
-        if (files.length === 0) {
-            return res.status(404).json({ success: false, message: 'File tidak ditemukan' });
-        }
-
-        res.json({ success: true, data: files[0] });
+        res.json({ 
+            success: true, 
+            data: activities.map(activity => ({
+                action: activity.action,
+                timestamp: activity.timestamp
+            }))
+        });
     } catch (error) {
-        res.status(500).json({ success: false, message: `Gagal mengambil file: ${error.message}` });
+        console.error('Error fetching activity:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: `Gagal mengambil log aktivitas: ${error.message}` 
+        });
     }
 });
 
-app.delete('/api/files/:id', validateUser, async (req, res) => {
-    try {
-        const fileId = req.params.id;
-        const { id: userId } = req.user;
 
-        // Cek apakah file ada dan milik user
-        const [files] = await pool.query(
-            'SELECT * FROM files WHERE id = ? AND user_id = ?',
-            [fileId, userId]
-        );
-
-        if (files.length === 0) {
-            return res.status(404).json({ success: false, message: 'File tidak ditemukan' });
-        }
-
-        const filePath = path.join(__dirname, files[0].file_path);
-
-        // Hapus file dari sistem
-        if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-        }
-
-        // Hapus dari database
-        await pool.query('DELETE FROM files WHERE id = ?', [fileId]);
-
-        res.json({ success: true, message: 'File berhasil dihapus' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: `Gagal menghapus file: ${error.message}` });
-    }
+// Middleware untuk menangani route yang tidak ada
+app.use((req, res) => {
+    res.status(404).json({ success: false, message: 'Endpoint tidak ditemukan' });
 });
-
 
 // Start server
 app.listen(PORT, () => {

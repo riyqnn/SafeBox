@@ -11,33 +11,40 @@ function FileList({ title, apiUrl, setModalIsOpen }) {
   const [contextMenu, setContextMenu] = useState({ id: null, x: 0, y: 0 });
   const menuRef = useRef(null);
 
-  // Config axios instance dengan header default
   const apiClient = axios.create({
     baseURL: 'http://localhost:5000/api',
     headers: {
       'x-user-id': localStorage.getItem('user_id')
     }
   });
-  
+
   useEffect(() => {
     const handleFileUploaded = (event) => {
       setFiles((prevFiles) => [...prevFiles, event.detail]);
     };
-  
+
     window.addEventListener('fileUploaded', handleFileUploaded);
     return () => {
       window.removeEventListener('fileUploaded', handleFileUploaded);
     };
   }, []);
-  
+
+  const fetchActivity = async () => {
+    try {
+        const response = await apiClient.get("/activity");
+        setActivityLog(response.data.data);
+    } catch (error) {
+        console.error("Gagal memuat aktivitas:", error);
+    }
+};
 
   const fetchFiles = async () => {
     try {
       setIsLoading(true);
-      const response = await apiClient.get(apiUrl); 
+      const response = await apiClient.get(apiUrl);
       
       if (response.data?.data && Array.isArray(response.data.data)) {
-        setFiles(response.data.data); // Update the state with the fetched files
+        setFiles(response.data.data);
       } else {
         throw new Error('Format data tidak valid');
       }
@@ -48,12 +55,11 @@ function FileList({ title, apiUrl, setModalIsOpen }) {
       setIsLoading(false);
     }
   };
-  
-  // Call fetchFiles when the component mounts
+
   useEffect(() => {
     fetchFiles();
   }, [apiUrl]);
-  
+
   useEffect(() => {
     const handleClickOutside = (e) => {
       if (menuRef.current && !menuRef.current.contains(e.target)) {
@@ -71,11 +77,29 @@ function FileList({ title, apiUrl, setModalIsOpen }) {
   }, [contextMenu.id]);
 
   const formatDate = (dateString) => {
-    const date = new Date(dateString);
-    return isValid(date) ? format(date, 'dd MMM yyyy') : 'N/A';
+    try {
+      const date = new Date(dateString);
+      return isValid(date) ? format(date, 'dd MMM yyyy') : 'N/A';
+    } catch (error) {
+      return 'N/A';
+    }
   };
 
-   const getFileType = (file) => {
+  const formatFileSize = (sizeInBytes) => {
+    if (!sizeInBytes) return '0 Bytes';
+    if (sizeInBytes >= 1024 ** 3) {
+      return `${(sizeInBytes / 1024 ** 3).toFixed(2)} GB`;
+    }
+    if (sizeInBytes >= 1024 ** 2) {
+      return `${(sizeInBytes / 1024 ** 2).toFixed(2)} MB`;
+    }
+    if (sizeInBytes >= 1024) {
+      return `${(sizeInBytes / 1024).toFixed(2)} KB`;
+    }
+    return `${sizeInBytes} Bytes`;
+  };
+
+  const getFileType = (file) => {
     const imageTypes = ['image/jpeg', 'image/png', 'image/gif'];
     const docTypes = [
       'application/pdf',
@@ -89,21 +113,19 @@ function FileList({ title, apiUrl, setModalIsOpen }) {
       'application/x-rar-compressed',
       'application/x-7z-compressed'
     ];
-  
-    // Cek berdasarkan MIME type
+
     if (imageTypes.includes(file.file_type)) return 'image';
     if (docTypes.includes(file.file_type)) return 'document';
     if (videoTypes.includes(file.file_type)) return 'video';
     if (archiveTypes.includes(file.file_type)) return 'archive';
-  
-    // Fallback: cek berdasarkan ekstensi file
+
     const ext = file.filename.split('.').pop().toLowerCase();
     
     if (['jpg', 'jpeg', 'png', 'gif'].includes(ext)) return 'image';
     if (['pdf', 'doc', 'docx', 'txt'].includes(ext)) return 'document';
     if (['mp4', 'mov'].includes(ext)) return 'video';
     if (['zip', 'rar', '7z'].includes(ext)) return 'archive';
-  
+
     return 'other';
   };
 
@@ -117,7 +139,7 @@ function FileList({ title, apiUrl, setModalIsOpen }) {
     };
     return `fas ${icons[fileType]} text-blue-500 mr-4 text-xl`;
   };
- 
+
   const handleContextMenu = (id, e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -127,26 +149,25 @@ function FileList({ title, apiUrl, setModalIsOpen }) {
       y: e.clientY + 10
     });
   };
-  
-  // Contoh untuk toggleFavorite
+
   const toggleFavorite = async (id, e) => {
     e.stopPropagation();
     try {
       await apiClient.patch(`/files/${id}/favorite`);
-      await fetchFiles(); // Refresh data after update
+      await fetchFiles();
     } catch (err) {
       console.error("Gagal mengubah favorite:", err);
       setError(err.message);
     }
   };
-  
-// Contoh untuk handleDelete
-const handleDelete = (id) => {
-  apiClient.delete(`/files/${id}`)
-    .then(() => setFiles(files.filter(file => file.id !== id)))
-    .catch(err => console.error("Delete failed:", err));
-  setContextMenu({ id: null, x: 0, y: 0 });
-};
+
+  const handleDelete = (id) => {
+    apiClient.delete(`/files/${id}`)
+      .then(() => setFiles(files.filter(file => file.id !== id)))
+      .catch(err => console.error("Delete failed:", err));
+      fetchActivity();
+    setContextMenu({ id: null, x: 0, y: 0 });
+  };
 
   const handleShare = async (file) => {
     try {
@@ -218,7 +239,6 @@ const handleDelete = (id) => {
                 className="px-6 py-4 hover:bg-blue-50 flex items-center cursor-pointer transition-colors relative"
                 onClick={() => openModal(file)}
               >
-                {/* Favorite Star */}
                 <i
                   className={`fas fa-star mr-4 text-xl cursor-pointer ${
                     file.favorite ? 'text-yellow-400' : 'text-gray-300'
@@ -226,23 +246,20 @@ const handleDelete = (id) => {
                   onClick={(e) => toggleFavorite(file.id, e)}
                 />
                 
-                {/* File Info */}
                 <div className="flex-1 flex items-center min-w-0">
-                <i className={getFileIcon(getFileType(file))}></i>
+                  <i className={getFileIcon(getFileType(file))}></i>
                   <span className="truncate text-gray-800 font-medium">
                     {file.filename}
                   </span>
                 </div>
-  
-                {/* Date and Size */}
+
                 <div className="text-gray-500 text-sm mr-8">
                   {formatDate(file.created_at)}
                 </div>
                 <div className="text-gray-500 text-sm mr-8">
-                {(file.file_size / (1024 * 1024)).toFixed(2)} MB
+                  {formatFileSize(file.file_size)}
                 </div>
-  
-                {/* Context Menu Trigger */}
+
                 <div 
                   className="text-gray-400 hover:text-gray-600 p-2 rounded-full hover:bg-gray-100 transition-colors"
                   onClick={(e) => {
@@ -252,8 +269,7 @@ const handleDelete = (id) => {
                 >
                   <i className="fas fa-ellipsis-v" />
                 </div>
-  
-                {/* Context Menu */}
+
                 {contextMenu.id === file.id && (
                   <div 
                     ref={menuRef}
@@ -288,68 +304,67 @@ const handleDelete = (id) => {
                 )}
               </div>
               
-              {/* Separator */}
               {index < files.length - 1 && (
-                <div className="h-px bg-gray-200 mx-6"></div>
+                <div className="h-px bg-gray-200 w-full"></div>
               )}
             </li>
           ))}
         </ul>
       )}
-  
-      {modalIsOpen && (
-  <div 
-    className="fixed inset-0 bg-black/30 flex items-center justify-center p-4 backdrop-blur-sm"
-    onClick={closeAll}
-  >
-    <div className="relative max-w-4xl w-full bg-white rounded-lg shadow-lg p-4" onClick={(e) => e.stopPropagation()}>
-      <button 
-        className="absolute -top-8 left-0 text-white hover:text-gray-300 text-3xl transition-colors"
-        onClick={closeAll}
-      >
-        ✕
-      </button>
 
-      {isImageFile(selectedFile) ? (
-        <img 
-          src={`http://localhost:5000${selectedFile.url}`}
-          alt={selectedFile.filename} 
-          className="mx-auto max-h-[90vh] object-contain rounded-lg shadow-2xl bg-gray-100"
-          onError={(e) => {
-            e.target.onerror = null;
-            e.target.src = "/fallback-image.png";
-          }}
-        />
-      ) : isVideoFile(selectedFile) ? (
-        <video controls className="mx-auto max-h-[90vh] rounded-lg shadow-2xl">
-          <source src={`http://localhost:5000${selectedFile.url}`} type="video/mp4" />
-          Browser Anda tidak mendukung video.
-        </video>
-      ) : isDocumentFile(selectedFile) ? (
-        <iframe 
-          src={`http://localhost:5000${selectedFile.url}`} 
-          className="w-full h-[500px] rounded-lg shadow-2xl"
+      {modalIsOpen && (
+        <div 
+          className="fixed inset-0 bg-black/30 flex items-center justify-center p-4 backdrop-blur-sm"
+          onClick={closeAll}
         >
-        </iframe>
-      ) : isZipFile(selectedFile) ? (
-        <div className="text-center p-4">
-          <p className="text-gray-600">File ZIP tidak bisa ditampilkan.</p>
-          <a 
-            href={`http://localhost:5000${selectedFile.url}`} 
-            download 
-            className="text-blue-500 underline"
-          >
-            Download ZIP
-          </a>
-        </div>
-      ) : (
-        <div className="text-center p-4">
-          <p className="text-gray-500">Preview tidak tersedia</p>
+          <div className="relative bg-transparant shadow-lg" onClick={( e) => e.stopPropagation()}>
+            <button 
+              className="absolute -top-8 left-0 text-white hover:text-gray-300 text-3xl transition-colors"
+              onClick={closeAll}
+            >
+              ✕
+            </button>
+
+            {isImageFile(selectedFile) ? (
+              <img 
+                src={`http://localhost:5000${selectedFile.url}`}
+                alt={selectedFile.filename} 
+                className="mx-auto max-h-[90vh] object-contain rounded-lg shadow-2xl bg-gray-100"
+                onError={(e) => {
+                  e.target.onerror = null;
+                  e.target.src = "/fallback-image.png";
+                }}
+              />
+            ) : isVideoFile(selectedFile) ? (
+              <video controls className="mx-auto max-h-[90vh] rounded-lg shadow-2xl">
+                <source src={`http://localhost:5000${selectedFile.url}`} type="video/mp4" />
+                Browser Anda tidak mendukung video.
+              </video>
+            ) : isDocumentFile(selectedFile) ? (
+              <iframe 
+                src={`http://localhost:5000${selectedFile.url}`} 
+                className="w-full h-[500px] rounded-lg shadow-2xl"
+              >
+              </iframe>
+            ) : isZipFile(selectedFile) ? (
+              <div className="text-center p-4">
+                <p className="text-gray-600">File ZIP tidak bisa ditampilkan.</p>
+                <a 
+                  href={`http://localhost:5000${selectedFile.url}`} 
+                  download 
+                  className="text-blue-500 underline"
+                >
+                  Download ZIP
+                </a>
+              </div>
+            ) : (
+              <div className="text-center p-4">
+                <p className="text-gray-500">Preview tidak tersedia</p>
+              </div>
+            )}
+          </div>
         </div>
       )}
-    </div>
-  </div>
-)}
     </div>
   );
 }

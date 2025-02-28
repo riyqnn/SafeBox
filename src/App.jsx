@@ -9,6 +9,7 @@ import Sidebar from "./frontend/layouts/Sidebar";
 import Header from "./frontend/layouts/Header";
 import Recent from "./frontend/pages/Recent";
 import Favorites from './frontend/pages/Favorites';
+import Shared from './frontend/pages/Shared';
 
 const MainLayout = ({ children, isPopupOpen }) => {
   return (
@@ -49,6 +50,17 @@ function App() {
           element={isAuthenticated ? (
             <MainLayout isPopupOpen={isPopupOpen}>
               <Files />
+            </MainLayout>
+          ) : (
+            <Navigate to="/sign-in" />
+          )}
+        />
+
+        <Route 
+          path="/shared" 
+          element={isAuthenticated ? (
+            <MainLayout isPopupOpen={isPopupOpen}>
+              <Shared setModalIsOpen={setPopupOpen} />
             </MainLayout>
           ) : (
             <Navigate to="/sign-in" />
